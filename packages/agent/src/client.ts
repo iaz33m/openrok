@@ -30,6 +30,7 @@ export type TunnelClientConfig = {
   desiredPublicPort?: number;
   reconnectMinMs: number;
   reconnectMaxMs: number;
+  recoverOnStreamError?: boolean;
   metadata?: ClientMetadata;
 };
 
@@ -65,6 +66,7 @@ export class TunnelClient extends EventEmitter {
   private streams = new Map<string, TargetConnection>();
   private status: TunnelClientStatus;
   private useBinaryStreamData = false;
+  private recoveryInProgress = false;
 
   constructor(private readonly config: TunnelClientConfig) {
     super();
@@ -130,6 +132,7 @@ export class TunnelClient extends EventEmitter {
       const ws = new WebSocket(url);
       this.ws = ws;
       this.useBinaryStreamData = false;
+      this.recoveryInProgress = false;
       let settled = false;
       let welcomed = false;
 
@@ -210,6 +213,7 @@ export class TunnelClient extends EventEmitter {
                 `bytesFromTarget=${stream.bytesFromTarget}`
             );
             if (message.type === "stream:error") {
+              this.recoverCurrentConnection(`server stream error on ${message.streamId}: ${message.message}`);
               stream.socket.destroy(new Error(message.message));
             } else {
               stream.socket.end();
@@ -285,6 +289,7 @@ export class TunnelClient extends EventEmitter {
         if (error) {
           this.emit("log", `Stream ${streamId} websocket send failed: ${error.message}`);
           socket.destroy(error);
+          this.recoverCurrentConnection(`websocket send failed on stream ${streamId}: ${error.message}`);
           return;
         }
         if (!socket.destroyed && this.streams.has(streamId)) {
@@ -318,7 +323,33 @@ export class TunnelClient extends EventEmitter {
         const message: StreamError = { type: "stream:error", streamId, message: error.message };
         send(ws, message);
       }
+      this.recoverCurrentConnection(`target error on stream ${streamId}: ${error.message}`);
     });
+  }
+
+  private recoverCurrentConnection(reason: string): void {
+    if (!this.config.recoverOnStreamError || !this.running || this.recoveryInProgress) return;
+    const ws = this.ws;
+    if (!ws || ws.readyState === ws.CLOSED || ws.readyState === ws.CLOSING) return;
+
+    this.recoveryInProgress = true;
+    this.emit("log", `Recovering tunnel after stream error: ${reason}`);
+    this.setStatus({ state: "error", lastError: reason });
+    this.closeAll();
+
+    try {
+      ws.close(1011, truncateCloseReason(`Recovering: ${reason}`));
+    } catch {
+      ws.terminate();
+      return;
+    }
+
+    const terminateTimer = setTimeout(() => {
+      if (this.ws === ws && ws.readyState !== ws.CLOSED) {
+        ws.terminate();
+      }
+    }, 2_000);
+    terminateTimer.unref?.();
   }
 
   private closeAll(): void {
@@ -451,6 +482,13 @@ function pauseWebSocket(ws: WebSocket): void {
 
 function resumeWebSocket(ws: WebSocket): void {
   (ws as unknown as { _socket?: { resume: () => void } })._socket?.resume();
+}
+
+function truncateCloseReason(reason: string): string {
+  const maxBytes = 120;
+  const buffer = Buffer.from(reason, "utf8");
+  if (buffer.length <= maxBytes) return reason;
+  return buffer.subarray(0, maxBytes).toString("utf8");
 }
 
 function cloneMetadata(metadata: ClientMetadata | undefined): ClientMetadata | undefined {

@@ -155,6 +155,7 @@ function startClient(): void {
     desiredPublicPort: currentConfig.publicPort,
     reconnectMinMs: currentConfig.reconnectMinMs,
     reconnectMaxMs: currentConfig.reconnectMaxMs,
+    recoverOnStreamError: true,
     metadata
   };
 
