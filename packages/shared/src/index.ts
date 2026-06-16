@@ -19,6 +19,7 @@ export type AgentHello = {
   targetHost: string;
   targetPort: number;
   desiredPublicPort?: number;
+  supportsBinaryStreamData?: boolean;
   metadata?: ClientMetadata;
 };
 
@@ -28,6 +29,7 @@ export type ServerWelcome = {
   tunnelId: string;
   publicHost: string;
   publicPort: number;
+  supportsBinaryStreamData?: boolean;
 };
 
 export type OpenStream = {
@@ -75,12 +77,39 @@ export type TunnelMessage =
   | PingMessage
   | PongMessage;
 
+export type BinaryStreamData = {
+  streamId: string;
+  data: Buffer;
+};
+
+const BINARY_STREAM_DATA_OPCODE = 1;
+const MAX_BINARY_STREAM_ID_BYTES = 255;
+
 export function encodeData(data: Buffer): string {
   return data.toString("base64");
 }
 
 export function decodeData(data: string): Buffer {
   return Buffer.from(data, "base64");
+}
+
+export function encodeBinaryStreamData(streamId: string, data: Buffer): Buffer {
+  const streamIdBytes = Buffer.from(streamId, "utf8");
+  if (streamIdBytes.length > MAX_BINARY_STREAM_ID_BYTES) {
+    throw new Error(`streamId is too long for binary frame: ${streamId}`);
+  }
+  return Buffer.concat([Buffer.from([BINARY_STREAM_DATA_OPCODE, streamIdBytes.length]), streamIdBytes, data]);
+}
+
+export function decodeBinaryStreamData(frame: Buffer): BinaryStreamData | undefined {
+  if (frame.length < 2 || frame[0] !== BINARY_STREAM_DATA_OPCODE) return undefined;
+  const streamIdLength = frame[1];
+  const payloadOffset = 2 + streamIdLength;
+  if (streamIdLength < 1 || frame.length < payloadOffset) return undefined;
+  return {
+    streamId: frame.subarray(2, payloadOffset).toString("utf8"),
+    data: frame.subarray(payloadOffset)
+  };
 }
 
 export function parsePort(value: string | undefined, fallback: number): number {

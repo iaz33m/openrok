@@ -11,7 +11,10 @@ const publicPort = await findFreePort();
 
 const echoServer = net.createServer((socket) => {
   socket.on("data", (chunk) => {
-    socket.write(Buffer.concat([Buffer.from("echo:"), chunk]));
+    socket.write(chunk);
+  });
+  socket.on("end", () => {
+    socket.end();
   });
 });
 
@@ -60,9 +63,15 @@ const agent = spawn(
 await waitForOutput(agent, "Tunnel ready", 5000);
 await delay(250);
 
-const response = await sendTcp("127.0.0.1", publicPort, Buffer.from("openrock"));
-if (response.toString("utf8") !== "echo:openrock") {
+const response = await sendTcp("127.0.0.1", publicPort, Buffer.from("openrock"), Buffer.byteLength("openrock"));
+if (response.toString("utf8") !== "openrock") {
   throw new Error(`Unexpected tunneled response: ${response.toString("utf8")}`);
+}
+
+const burstPayload = crypto.randomBytes(2 * 1024 * 1024);
+const burstResponse = await sendTcp("127.0.0.1", publicPort, burstPayload, burstPayload.length);
+if (!burstResponse.equals(burstPayload)) {
+  throw new Error(`Burst payload mismatch: sent ${burstPayload.length}, received ${burstResponse.length}`);
 }
 
 const dashboard = await fetch(`http://127.0.0.1:${httpPort}/api/tunnels`, {
@@ -76,6 +85,9 @@ if (!dashboard.ok) {
 const body = await dashboard.json();
 if (body.tunnels.length !== 1 || body.tunnels[0].publicPort !== publicPort) {
   throw new Error(`Unexpected dashboard response: ${JSON.stringify(body)}`);
+}
+if (body.tunnels[0].binaryStreamData !== true) {
+  throw new Error(`Binary stream mode was not negotiated: ${JSON.stringify(body.tunnels[0])}`);
 }
 if (!body.tunnels[0].metadata?.hostname || !body.tunnels[0].metadata?.username) {
   throw new Error(`Missing client metadata: ${JSON.stringify(body.tunnels[0])}`);
@@ -131,14 +143,18 @@ function waitForOutput(child, needle, timeoutMs) {
   });
 }
 
-function sendTcp(host, port, payload) {
+function sendTcp(host, port, payload, expectedBytes) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(port, host);
     const chunks = [];
     socket.once("connect", () => socket.write(payload));
     socket.on("data", (chunk) => {
       chunks.push(chunk);
-      socket.end();
+      const received = chunks.reduce((total, item) => total + item.length, 0);
+      if (received >= expectedBytes) {
+        socket.end();
+        resolve(Buffer.concat(chunks));
+      }
     });
     socket.once("end", () => resolve(Buffer.concat(chunks)));
     socket.once("error", reject);

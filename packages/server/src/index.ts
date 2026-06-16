@@ -9,7 +9,9 @@ import { WebSocketServer, type WebSocket } from "ws";
 import {
   PROTOCOL_VERSION,
   createTunnelId,
+  decodeBinaryStreamData,
   decodeData,
+  encodeBinaryStreamData,
   encodeData,
   isTunnelMessage,
   type AgentHello,
@@ -52,6 +54,7 @@ type Tunnel = {
   lastSeenAt: number;
   lastActivityAt: number;
   lastHeartbeatWarningAt?: number;
+  binaryStreamData: boolean;
   ws: WebSocket;
   publicServer: net.Server;
   streams: Map<string, PublicConnection>;
@@ -174,7 +177,8 @@ wss.on("connection", (ws) => {
         version: PROTOCOL_VERSION,
         tunnelId: tunnel.id,
         publicHost: tunnel.publicHost,
-        publicPort: tunnel.publicPort
+        publicPort: tunnel.publicPort,
+        supportsBinaryStreamData: tunnel.binaryStreamData
       });
       console.info(
         `Tunnel ${tunnel.id} online: ${tunnel.publicHost}:${tunnel.publicPort} -> ${tunnel.agentId} ${tunnel.targetHost}:${tunnel.targetPort}`
@@ -185,12 +189,11 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    ws.on("message", (message) => {
-      const parsed = parseMessage(message);
-      if (!parsed || !tunnel) return;
+    ws.on("message", (message, isBinary) => {
+      if (!tunnel) return;
       tunnel.lastSeenAt = Date.now();
       tunnel.lastActivityAt = tunnel.lastSeenAt;
-      handleAgentMessage(tunnel, parsed);
+      handleAgentRawMessage(tunnel, message, isBinary);
     });
 
     heartbeat = setInterval(() => {
@@ -268,6 +271,7 @@ async function registerTunnel(ws: WebSocket, hello: AgentHello): Promise<Tunnel>
     connectedAt: Date.now(),
     lastSeenAt: Date.now(),
     lastActivityAt: Date.now(),
+    binaryStreamData: Boolean(hello.supportsBinaryStreamData),
     ws,
     publicServer,
     streams: new Map(),
@@ -330,12 +334,17 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
     if (stream) stream.bytesFromClient += chunk.length;
     tunnel.lastActivityAt = Date.now();
     tunnel.stats.bytesFromClient += chunk.length;
-    const dataMessage: StreamData = {
-      type: "stream:data",
-      streamId,
-      data: encodeData(chunk)
-    };
-    send(tunnel.ws, dataMessage);
+    socket.pause();
+    sendStreamData(tunnel.ws, streamId, chunk, tunnel.binaryStreamData, (error) => {
+      if (error) {
+        console.warn(`Tunnel ${tunnel.id} stream ${streamId} websocket send failed: ${error.message}`);
+        socket.destroy(error);
+        return;
+      }
+      if (!socket.destroyed && tunnel.streams.has(streamId)) {
+        socket.resume();
+      }
+    });
   });
 
   socket.on("close", (hadError) => {
@@ -360,16 +369,24 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
   });
 }
 
+function handleAgentRawMessage(tunnel: Tunnel, raw: WebSocket.RawData, isBinary: boolean): void {
+  if (isBinary) {
+    const dataMessage = decodeBinaryStreamData(rawDataToBuffer(raw));
+    if (dataMessage) {
+      handleAgentStreamData(tunnel, dataMessage.streamId, dataMessage.data);
+    }
+    return;
+  }
+
+  const parsed = parseMessage(raw);
+  if (!parsed) return;
+  handleAgentMessage(tunnel, parsed);
+}
+
 function handleAgentMessage(tunnel: Tunnel, message: TunnelMessage): void {
   switch (message.type) {
     case "stream:data": {
-      const stream = tunnel.streams.get(message.streamId);
-      if (!stream || stream.socket.destroyed) return;
-      const data = decodeData(message.data);
-      stream.bytesFromTarget += data.length;
-      tunnel.lastActivityAt = Date.now();
-      tunnel.stats.bytesFromTarget += data.length;
-      stream.socket.write(data);
+      handleAgentStreamData(tunnel, message.streamId, decodeData(message.data));
       return;
     }
     case "stream:close": {
@@ -403,6 +420,21 @@ function handleAgentMessage(tunnel: Tunnel, message: TunnelMessage): void {
       return;
     default:
       return;
+  }
+}
+
+function handleAgentStreamData(tunnel: Tunnel, streamId: string, data: Buffer): void {
+  const stream = tunnel.streams.get(streamId);
+  if (!stream || stream.socket.destroyed) return;
+  stream.bytesFromTarget += data.length;
+  tunnel.lastActivityAt = Date.now();
+  tunnel.stats.bytesFromTarget += data.length;
+  if (!stream.socket.write(data)) {
+    pauseWebSocket(tunnel.ws);
+    const resume = () => resumeWebSocket(tunnel.ws);
+    stream.socket.once("drain", resume);
+    stream.socket.once("close", resume);
+    stream.socket.once("error", resume);
   }
 }
 
@@ -464,6 +496,44 @@ function send(ws: WebSocket, message: TunnelMessage): void {
   }
 }
 
+function sendStreamData(
+  ws: WebSocket,
+  streamId: string,
+  data: Buffer,
+  useBinaryFrames: boolean,
+  callback: (error?: Error) => void
+): void {
+  if (ws.readyState !== ws.OPEN) {
+    callback(new Error("Agent websocket is not open"));
+    return;
+  }
+  if (useBinaryFrames) {
+    ws.send(encodeBinaryStreamData(streamId, data), { binary: true }, callback);
+    return;
+  }
+  const message: StreamData = {
+    type: "stream:data",
+    streamId,
+    data: encodeData(data)
+  };
+  ws.send(JSON.stringify(message), callback);
+}
+
+function rawDataToBuffer(raw: WebSocket.RawData): Buffer {
+  if (Buffer.isBuffer(raw)) return raw;
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw);
+  if (Array.isArray(raw)) return Buffer.concat(raw);
+  return Buffer.from(raw);
+}
+
+function pauseWebSocket(ws: WebSocket): void {
+  (ws as unknown as { _socket?: { pause: () => void } })._socket?.pause();
+}
+
+function resumeWebSocket(ws: WebSocket): void {
+  (ws as unknown as { _socket?: { resume: () => void } })._socket?.resume();
+}
+
 function listen(server: net.Server, port: number, host: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error) => {
@@ -492,6 +562,7 @@ function serializeTunnel(tunnel: Tunnel) {
     publicHost: tunnel.publicHost,
     publicPort: tunnel.publicPort,
     publicEndpoint: `${tunnel.publicHost}:${tunnel.publicPort}`,
+    binaryStreamData: tunnel.binaryStreamData,
     connectedAt: new Date(tunnel.connectedAt).toISOString(),
     lastSeenAt: new Date(tunnel.lastSeenAt).toISOString(),
     lastActivityAt: new Date(tunnel.lastActivityAt).toISOString(),

@@ -5,7 +5,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import WebSocket, { type RawData } from "ws";
 import {
   PROTOCOL_VERSION,
+  decodeBinaryStreamData,
   decodeData,
+  encodeBinaryStreamData,
   encodeData,
   type AgentHello,
   type ClientMetadata,
@@ -62,6 +64,7 @@ export class TunnelClient extends EventEmitter {
   private ws?: WebSocket;
   private streams = new Map<string, TargetConnection>();
   private status: TunnelClientStatus;
+  private useBinaryStreamData = false;
 
   constructor(private readonly config: TunnelClientConfig) {
     super();
@@ -126,6 +129,7 @@ export class TunnelClient extends EventEmitter {
 
       const ws = new WebSocket(url);
       this.ws = ws;
+      this.useBinaryStreamData = false;
       let settled = false;
       let welcomed = false;
 
@@ -154,6 +158,7 @@ export class TunnelClient extends EventEmitter {
           targetHost: this.config.targetHost,
           targetPort: this.config.targetPort,
           desiredPublicPort: this.config.desiredPublicPort,
+          supportsBinaryStreamData: true,
           metadata: this.config.metadata
         };
         this.setStatus({ state: "connected", connectedAt: new Date().toISOString() });
@@ -161,7 +166,15 @@ export class TunnelClient extends EventEmitter {
         this.emit("log", `Connected to ${this.config.serverUrl}; requested ${this.config.targetHost}:${this.config.targetPort}`);
       });
 
-      ws.on("message", (raw) => {
+      ws.on("message", (raw, isBinary) => {
+        if (isBinary) {
+          const dataMessage = decodeBinaryStreamData(rawDataToBuffer(raw));
+          if (dataMessage) {
+            this.handleServerStreamData(ws, dataMessage.streamId, dataMessage.data);
+          }
+          return;
+        }
+
         const message = parseMessage(raw);
         if (!message) return;
 
@@ -182,11 +195,7 @@ export class TunnelClient extends EventEmitter {
         }
 
         if (message.type === "stream:data") {
-          const stream = this.streams.get(message.streamId);
-          if (!stream || stream.socket.destroyed) return;
-          const data = decodeData(message.data);
-          stream.bytesFromPublic += data.length;
-          stream.socket.write(data);
+          this.handleServerStreamData(ws, message.streamId, decodeData(message.data));
           return;
         }
 
@@ -222,8 +231,22 @@ export class TunnelClient extends EventEmitter {
     });
   }
 
+  private handleServerStreamData(ws: WebSocket, streamId: string, data: Buffer): void {
+    const stream = this.streams.get(streamId);
+    if (!stream || stream.socket.destroyed) return;
+    stream.bytesFromPublic += data.length;
+    if (!stream.socket.write(data)) {
+      pauseWebSocket(ws);
+      const resume = () => resumeWebSocket(ws);
+      stream.socket.once("drain", resume);
+      stream.socket.once("close", resume);
+      stream.socket.once("error", resume);
+    }
+  }
+
   private handleWelcome(message: ServerWelcome): void {
     const publicEndpoint = `${message.publicHost}:${message.publicPort}`;
+    this.useBinaryStreamData = Boolean(message.supportsBinaryStreamData);
     this.setStatus({
       state: "ready",
       tunnelId: message.tunnelId,
@@ -257,12 +280,17 @@ export class TunnelClient extends EventEmitter {
     socket.on("data", (chunk) => {
       const stream = this.streams.get(streamId);
       if (stream) stream.bytesFromTarget += chunk.length;
-      const message: StreamData = {
-        type: "stream:data",
-        streamId,
-        data: encodeData(chunk)
-      };
-      send(ws, message);
+      socket.pause();
+      sendStreamData(ws, streamId, chunk, this.useBinaryStreamData, (error) => {
+        if (error) {
+          this.emit("log", `Stream ${streamId} websocket send failed: ${error.message}`);
+          socket.destroy(error);
+          return;
+        }
+        if (!socket.destroyed && this.streams.has(streamId)) {
+          socket.resume();
+        }
+      });
     });
 
     socket.on("close", (hadError) => {
@@ -385,6 +413,44 @@ function send(ws: WebSocket, message: TunnelMessage): void {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(message));
   }
+}
+
+function sendStreamData(
+  ws: WebSocket,
+  streamId: string,
+  data: Buffer,
+  useBinaryFrames: boolean,
+  callback: (error?: Error) => void
+): void {
+  if (ws.readyState !== ws.OPEN) {
+    callback(new Error("Server websocket is not open"));
+    return;
+  }
+  if (useBinaryFrames) {
+    ws.send(encodeBinaryStreamData(streamId, data), { binary: true }, callback);
+    return;
+  }
+  const message: StreamData = {
+    type: "stream:data",
+    streamId,
+    data: encodeData(data)
+  };
+  ws.send(JSON.stringify(message), callback);
+}
+
+function rawDataToBuffer(raw: RawData): Buffer {
+  if (Buffer.isBuffer(raw)) return raw;
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw);
+  if (Array.isArray(raw)) return Buffer.concat(raw);
+  return Buffer.from(raw);
+}
+
+function pauseWebSocket(ws: WebSocket): void {
+  (ws as unknown as { _socket?: { pause: () => void } })._socket?.pause();
+}
+
+function resumeWebSocket(ws: WebSocket): void {
+  (ws as unknown as { _socket?: { resume: () => void } })._socket?.resume();
 }
 
 function cloneMetadata(metadata: ClientMetadata | undefined): ClientMetadata | undefined {
