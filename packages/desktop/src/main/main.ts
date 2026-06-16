@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, powerSaveBlocker } from "electron";
 import {
   collectClientMetadata,
   defaultAgentId,
@@ -15,6 +15,11 @@ import type { DesktopClientConfig, DesktopClientState, SafeDesktopClientConfig, 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 app.setName("OpenRock Client");
+app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+app.commandLine.appendSwitch("disable-renderer-backgrounding");
+if (process.env.OPENROCK_USER_DATA_DIR) {
+  app.setPath("userData", process.env.OPENROCK_USER_DATA_DIR);
+}
 
 const appVersion = app.getVersion();
 const metadata = collectClientMetadata("electron", appVersion);
@@ -25,6 +30,7 @@ let client: TunnelClient | undefined;
 let lastStatus: TunnelClientStatus;
 let logs: string[] = [];
 let isQuitting = false;
+let powerSaveBlockerId: number | undefined;
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -37,20 +43,29 @@ app.on("second-instance", () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
-  client?.stop();
+  addLog("Application quitting");
+  client?.stop("Application quitting");
 });
 
 app.on("window-all-closed", () => {
   // Keep the tunnel alive in the background.
 });
 
+app.on("activate", () => {
+  showMainWindow();
+});
+
 app.whenReady().then(() => {
   currentConfig = loadConfig();
   lastStatus = buildIdleStatus(currentConfig);
   applyLoginItemSetting(currentConfig.openAtLogin);
+  startPowerSaveBlocker();
   registerIpc();
   createWindow();
   if (currentConfig.token) startClient();
+  if (process.env.OPENROCK_WINDOW_LIFECYCLE_TEST === "1") {
+    scheduleWindowLifecycleSmoke();
+  }
 });
 
 process.on("uncaughtException", (error) => {
@@ -71,14 +86,18 @@ function createWindow(): void {
     title: "OpenRock Client",
     webPreferences: {
       preload: join(__dirname, "../preload/preload.cjs"),
+      backgroundThrottling: false,
       nodeIntegration: false,
       contextIsolation: true
     }
   });
 
+  attachWindowLifecycleLogging(mainWindow);
+
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();
+      addLog("Window close requested; hiding window and keeping tunnel active");
       mainWindow?.hide();
     }
   });
@@ -110,7 +129,7 @@ function registerIpc(): void {
     return getState();
   });
   ipcMain.handle("client:disconnect", () => {
-    client?.stop();
+    client?.stop("Disconnected manually");
     client = undefined;
     lastStatus = buildIdleStatus(currentConfig);
     addLog("Disconnected manually");
@@ -157,7 +176,7 @@ function startClient(): void {
 }
 
 function restartClient(): void {
-  client?.stop();
+  client?.stop("Configuration changed");
   client = undefined;
   lastStatus = buildIdleStatus(currentConfig);
   if (currentConfig.token) startClient();
@@ -173,19 +192,28 @@ function getState(): DesktopClientState {
 }
 
 function broadcastState(): void {
-  mainWindow?.webContents.send("client:state", getState());
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+  try {
+    mainWindow.webContents.send("client:state", getState());
+  } catch (error) {
+    appendLogLine(`Unable to broadcast state: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function addLog(line: string): void {
   const stamp = new Date().toLocaleTimeString();
   const entry = `${stamp} ${line}`;
   logs = [entry, ...logs].slice(0, 100);
+  appendLogLine(line);
+  broadcastState();
+}
+
+function appendLogLine(line: string): void {
   try {
     appendFileSync(logPath(), `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
   } catch {
     // Logging must never break the tunnel.
   }
-  broadcastState();
 }
 
 function loadConfig(): DesktopClientConfig {
@@ -294,6 +322,62 @@ function configPath(): string {
 
 function logPath(): string {
   return join(app.getPath("userData"), "openrock-client.log");
+}
+
+function attachWindowLifecycleLogging(window: BrowserWindow): void {
+  const logWindowEvent = (eventName: string) => {
+    addLog(`Window ${eventName}; tunnel remains ${client ? client.getStatus().state : lastStatus.state}`);
+  };
+
+  window.on("minimize", () => logWindowEvent("minimized"));
+  window.on("maximize", () => logWindowEvent("maximized"));
+  window.on("unmaximize", () => logWindowEvent("unmaximized"));
+  window.on("restore", () => logWindowEvent("restored"));
+  window.on("hide", () => logWindowEvent("hidden"));
+  window.on("show", () => logWindowEvent("shown"));
+  window.on("blur", () => logWindowEvent("blurred"));
+  window.on("focus", () => logWindowEvent("focused"));
+  window.on("closed", () => {
+    addLog("Window closed");
+    if (mainWindow === window) mainWindow = undefined;
+  });
+
+  window.webContents.on("render-process-gone", (_event, details) => {
+    addLog(`Renderer process gone: reason=${details.reason} exitCode=${details.exitCode}`);
+    if (!isQuitting && !window.isDestroyed()) {
+      void window.loadFile(join(__dirname, "../../renderer/index.html"));
+    }
+  });
+  window.webContents.on("unresponsive", () => addLog("Renderer became unresponsive"));
+  window.webContents.on("responsive", () => addLog("Renderer became responsive"));
+}
+
+function startPowerSaveBlocker(): void {
+  try {
+    if (powerSaveBlockerId === undefined) {
+      powerSaveBlockerId = powerSaveBlocker.start("prevent-app-suspension");
+      addLog(`Power save blocker active: ${powerSaveBlockerId}`);
+    }
+  } catch {
+    // Some platforms may not support this; the tunnel can still run.
+  }
+}
+
+function scheduleWindowLifecycleSmoke(): void {
+  const steps: Array<[number, string, () => void]> = [
+    [1_500, "test minimize", () => mainWindow?.minimize()],
+    [3_000, "test restore", () => mainWindow?.restore()],
+    [4_500, "test maximize", () => mainWindow?.maximize()],
+    [6_000, "test unmaximize", () => mainWindow?.unmaximize()],
+    [7_500, "test focus", () => mainWindow?.focus()]
+  ];
+
+  for (const [delayMs, label, action] of steps) {
+    setTimeout(() => {
+      addLog(`Window lifecycle smoke: ${label}`);
+      action();
+    }, delayMs);
+  }
 }
 
 function applyLoginItemSetting(openAtLogin: boolean): void {

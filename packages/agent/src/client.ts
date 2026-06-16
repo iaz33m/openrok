@@ -113,9 +113,9 @@ export class TunnelClient extends EventEmitter {
     this.setStatus({ state: "idle", reconnectInMs: undefined });
   }
 
-  stop(): void {
+  stop(reason = "Client stopped"): void {
     this.running = false;
-    this.ws?.close(1000, "Client stopped");
+    this.ws?.close(1000, reason);
     this.closeAll();
   }
 
