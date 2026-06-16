@@ -1,0 +1,30 @@
+{
+  "name": "@openrock/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@openrock/shared": "0.1.0",
+    "cookie": "^1.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "nanoid": "^5.0.9",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/cookie": "^0.6.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2"
+  }
+}

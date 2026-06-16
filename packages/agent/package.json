@@ -1,0 +1,36 @@
+{
+  "name": "@openrock/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    }
+  },
+  "bin": {
+    "openrock-agent": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/make-bin-executable.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@openrock/shared": "0.1.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2"
+  }
+}

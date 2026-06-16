@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist/main",
+    "composite": true,
+    "tsBuildInfoFile": "dist/main/tsconfig.tsbuildinfo",
+    "types": ["node"]
+  },
+  "references": [
+    { "path": "../shared" },
+    { "path": "../agent" }
+  ],
+  "include": ["src/main/**/*.ts", "src/preload/**/*.cts", "src/shared/**/*.ts"]
+}

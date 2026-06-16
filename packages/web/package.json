@@ -1,0 +1,23 @@
+{
+  "name": "@openrock/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b --noEmit && vite build",
+    "typecheck": "tsc -b --noEmit",
+    "dev": "vite --host 0.0.0.0"
+  },
+  "dependencies": {
+    "lucide-react": "^1.18.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.2",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.7.2",
+    "vite": "^8.0.16"
+  }
+}

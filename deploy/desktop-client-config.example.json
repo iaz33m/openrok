@@ -1,0 +1,12 @@
+{
+  "serverUrl": "ws://44.193.192.39:8080/agent",
+  "token": "replace-with-server-agent-token",
+  "agentId": "rdp-workstation",
+  "name": "RDP Workstation",
+  "targetHost": "127.0.0.1",
+  "targetPort": 3389,
+  "publicPort": 40000,
+  "reconnectMinMs": 1000,
+  "reconnectMaxMs": 15000,
+  "openAtLogin": true
+}

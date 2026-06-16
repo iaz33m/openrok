@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-types/
+.env
+.env.local
+npm-debug.log*
+coverage/
+release/
+.DS_Store
+*.tsbuildinfo
+packages/web/vite.config.d.ts
+packages/web/vite.config.js
+packages/web/vite.config.js.map
+/index.html

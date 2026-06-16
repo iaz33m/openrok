@@ -1,0 +1,30 @@
+{
+  "name": "openrock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted TCP tunnel service with a React dashboard and local forwarding agent.",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:server && npm run build -w @openrock/desktop-client",
+    "build:server": "npm run build -w @openrock/shared && npm run build -w @openrock/agent && npm run build -w @openrock/server && npm run build -w @openrock/web",
+    "check": "npm run typecheck -w @openrock/shared && npm run typecheck -w @openrock/agent && npm run typecheck -w @openrock/server && npm run typecheck -w @openrock/web && npm run typecheck -w @openrock/desktop-client",
+    "test": "npm run test --workspaces --if-present",
+    "dev:server": "npm run dev -w @openrock/server",
+    "dev:agent": "npm run dev -w @openrock/agent",
+    "dev:web": "npm run dev -w @openrock/web",
+    "dev:desktop": "npm run start -w @openrock/desktop-client",
+    "package:desktop": "npm run package -w @openrock/desktop-client",
+    "smoke": "node tests/smoke-tcp-tunnel.mjs",
+    "smoke:live": "node tests/live-server-smoke.mjs"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
