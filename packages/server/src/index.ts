@@ -50,6 +50,8 @@ type Tunnel = {
   publicPort: number;
   connectedAt: number;
   lastSeenAt: number;
+  lastActivityAt: number;
+  lastHeartbeatWarningAt?: number;
   ws: WebSocket;
   publicServer: net.Server;
   streams: Map<string, PublicConnection>;
@@ -60,7 +62,8 @@ const tunnels = new Map<string, Tunnel>();
 const tunnelsByAgent = new Map<string, Tunnel>();
 const allocatedPorts = new Set<number>();
 const HEARTBEAT_INTERVAL_MS = 25_000;
-const HEARTBEAT_TIMEOUT_MS = 75_000;
+const HEARTBEAT_TIMEOUT_MS = 10 * 60_000;
+const HEARTBEAT_WARNING_INTERVAL_MS = 60_000;
 
 const app = express();
 app.use(cors());
@@ -186,14 +189,28 @@ wss.on("connection", (ws) => {
       const parsed = parseMessage(message);
       if (!parsed || !tunnel) return;
       tunnel.lastSeenAt = Date.now();
+      tunnel.lastActivityAt = tunnel.lastSeenAt;
       handleAgentMessage(tunnel, parsed);
     });
 
     heartbeat = setInterval(() => {
       if (!tunnel || ws.readyState !== ws.OPEN) return;
-      const staleForMs = Date.now() - tunnel.lastSeenAt;
+      const now = Date.now();
+      const staleForMs = now - tunnel.lastSeenAt;
+      const inactiveForMs = now - tunnel.lastActivityAt;
       if (staleForMs > HEARTBEAT_TIMEOUT_MS) {
-        console.warn(`Tunnel ${tunnel.id} heartbeat timed out after ${staleForMs}ms; terminating agent websocket`);
+        const shouldWarn =
+          !tunnel.lastHeartbeatWarningAt || now - tunnel.lastHeartbeatWarningAt > HEARTBEAT_WARNING_INTERVAL_MS;
+        if (shouldWarn) {
+          tunnel.lastHeartbeatWarningAt = now;
+          console.warn(
+            `Tunnel ${tunnel.id} heartbeat stale for ${staleForMs}ms; activeStreams=${tunnel.streams.size} ` +
+              `inactiveForMs=${inactiveForMs}`
+          );
+        }
+      }
+      if (staleForMs > HEARTBEAT_TIMEOUT_MS && tunnel.streams.size === 0 && inactiveForMs > HEARTBEAT_TIMEOUT_MS) {
+        console.warn(`Tunnel ${tunnel.id} heartbeat timed out after ${staleForMs}ms; terminating idle agent websocket`);
         ws.terminate();
         return;
       }
@@ -250,6 +267,7 @@ async function registerTunnel(ws: WebSocket, hello: AgentHello): Promise<Tunnel>
     publicPort,
     connectedAt: Date.now(),
     lastSeenAt: Date.now(),
+    lastActivityAt: Date.now(),
     ws,
     publicServer,
     streams: new Map(),
@@ -294,6 +312,7 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
   });
   tunnel.stats.totalConnections += 1;
   tunnel.stats.activeConnections += 1;
+  tunnel.lastActivityAt = Date.now();
   console.info(
     `Tunnel ${tunnel.id} stream ${streamId} opened from ${socket.remoteAddress ?? "unknown"}:${socket.remotePort ?? 0}`
   );
@@ -309,6 +328,7 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
   socket.on("data", (chunk) => {
     const stream = tunnel.streams.get(streamId);
     if (stream) stream.bytesFromClient += chunk.length;
+    tunnel.lastActivityAt = Date.now();
     tunnel.stats.bytesFromClient += chunk.length;
     const dataMessage: StreamData = {
       type: "stream:data",
@@ -321,6 +341,7 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
   socket.on("close", (hadError) => {
     const stream = removePublicStream(tunnel, streamId);
     if (!stream) return;
+    tunnel.lastActivityAt = Date.now();
     console.info(
       `Tunnel ${tunnel.id} stream ${streamId} public socket closed hadError=${hadError} ` +
         `bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}`
@@ -330,6 +351,7 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
 
   socket.on("error", (error) => {
     const stream = tunnel.streams.get(streamId);
+    tunnel.lastActivityAt = Date.now();
     console.warn(
       `Tunnel ${tunnel.id} stream ${streamId} public socket error: ${error.message}` +
         (stream ? ` bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}` : "")
@@ -345,6 +367,7 @@ function handleAgentMessage(tunnel: Tunnel, message: TunnelMessage): void {
       if (!stream || stream.socket.destroyed) return;
       const data = decodeData(message.data);
       stream.bytesFromTarget += data.length;
+      tunnel.lastActivityAt = Date.now();
       tunnel.stats.bytesFromTarget += data.length;
       stream.socket.write(data);
       return;
@@ -352,6 +375,7 @@ function handleAgentMessage(tunnel: Tunnel, message: TunnelMessage): void {
     case "stream:close": {
       const stream = removePublicStream(tunnel, message.streamId);
       if (stream) {
+        tunnel.lastActivityAt = Date.now();
         console.info(
           `Tunnel ${tunnel.id} stream ${message.streamId} closed by agent reason="${message.reason ?? "none"}" ` +
             `bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}`
@@ -363,6 +387,7 @@ function handleAgentMessage(tunnel: Tunnel, message: TunnelMessage): void {
     case "stream:error": {
       const stream = removePublicStream(tunnel, message.streamId);
       if (stream) {
+        tunnel.lastActivityAt = Date.now();
         console.warn(
           `Tunnel ${tunnel.id} stream ${message.streamId} errored by agent: ${message.message} ` +
             `bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}`
@@ -469,6 +494,7 @@ function serializeTunnel(tunnel: Tunnel) {
     publicEndpoint: `${tunnel.publicHost}:${tunnel.publicPort}`,
     connectedAt: new Date(tunnel.connectedAt).toISOString(),
     lastSeenAt: new Date(tunnel.lastSeenAt).toISOString(),
+    lastActivityAt: new Date(tunnel.lastActivityAt).toISOString(),
     uptimeSeconds: Math.floor((Date.now() - tunnel.connectedAt) / 1000),
     stats: tunnel.stats,
     streams: [...tunnel.streams.entries()].map(([streamId, stream]) => ({
