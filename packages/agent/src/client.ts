@@ -52,6 +52,9 @@ export type TunnelClientStatus = {
 
 type TargetConnection = {
   socket: net.Socket;
+  openedAt: number;
+  bytesFromPublic: number;
+  bytesFromTarget: number;
 };
 
 export class TunnelClient extends EventEmitter {
@@ -181,26 +184,39 @@ export class TunnelClient extends EventEmitter {
         if (message.type === "stream:data") {
           const stream = this.streams.get(message.streamId);
           if (!stream || stream.socket.destroyed) return;
-          stream.socket.write(decodeData(message.data));
+          const data = decodeData(message.data);
+          stream.bytesFromPublic += data.length;
+          stream.socket.write(data);
           return;
         }
 
         if (message.type === "stream:close" || message.type === "stream:error") {
           const stream = this.streams.get(message.streamId);
           if (stream) {
-            stream.socket.end();
             this.streams.delete(message.streamId);
             this.updateStreamCount();
+            this.emit(
+              "log",
+              `Stream ${message.streamId} closed by server type=${message.type} bytesFromPublic=${stream.bytesFromPublic} ` +
+                `bytesFromTarget=${stream.bytesFromTarget}`
+            );
+            if (message.type === "stream:error") {
+              stream.socket.destroy(new Error(message.message));
+            } else {
+              stream.socket.end();
+            }
           }
         }
       });
 
       ws.on("close", (code, reason) => {
         const text = reason.toString("utf8") || `websocket closed with code ${code}`;
+        this.emit("log", `WebSocket closed: ${text}`);
         finish(!welcomed && this.running ? new Error(text) : undefined);
       });
 
       ws.on("error", (error) => {
+        this.emit("log", `WebSocket error: ${error.message}`);
         finish(error);
       });
     });
@@ -223,14 +239,24 @@ export class TunnelClient extends EventEmitter {
 
   private openTargetConnection(ws: WebSocket, streamId: string): void {
     const socket = net.connect(this.config.targetPort, this.config.targetHost);
-    this.streams.set(streamId, { socket });
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30_000);
+    this.streams.set(streamId, {
+      socket,
+      openedAt: Date.now(),
+      bytesFromPublic: 0,
+      bytesFromTarget: 0
+    });
     this.updateStreamCount();
+    this.emit("log", `Stream ${streamId} opened for ${this.config.targetHost}:${this.config.targetPort}`);
 
     socket.on("connect", () => {
       this.emit("log", `Stream ${streamId} connected to ${this.config.targetHost}:${this.config.targetPort}`);
     });
 
     socket.on("data", (chunk) => {
+      const stream = this.streams.get(streamId);
+      if (stream) stream.bytesFromTarget += chunk.length;
       const message: StreamData = {
         type: "stream:data",
         streamId,
@@ -239,18 +265,31 @@ export class TunnelClient extends EventEmitter {
       send(ws, message);
     });
 
-    socket.on("close", () => {
+    socket.on("close", (hadError) => {
+      const stream = this.streams.get(streamId);
+      if (!stream) return;
       this.streams.delete(streamId);
       this.updateStreamCount();
-      const message: CloseStream = { type: "stream:close", streamId, reason: "Target closed" };
+      this.emit(
+        "log",
+        `Stream ${streamId} target closed hadError=${hadError} bytesFromPublic=${stream.bytesFromPublic} ` +
+          `bytesFromTarget=${stream.bytesFromTarget}`
+      );
+      const message: CloseStream = { type: "stream:close", streamId, reason: hadError ? "Target socket error" : "Target closed" };
       send(ws, message);
     });
 
     socket.on("error", (error) => {
-      this.streams.delete(streamId);
-      this.updateStreamCount();
-      const message: StreamError = { type: "stream:error", streamId, message: error.message };
-      send(ws, message);
+      const stream = this.streams.get(streamId);
+      this.emit(
+        "log",
+        `Stream ${streamId} target error: ${error.message}` +
+          (stream ? ` bytesFromPublic=${stream.bytesFromPublic} bytesFromTarget=${stream.bytesFromTarget}` : "")
+      );
+      if (stream) {
+        const message: StreamError = { type: "stream:error", streamId, message: error.message };
+        send(ws, message);
+      }
     });
   }
 

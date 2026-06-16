@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, ipcMain, Menu } from "electron";
@@ -51,6 +51,14 @@ app.whenReady().then(() => {
   registerIpc();
   createWindow();
   if (currentConfig.token) startClient();
+});
+
+process.on("uncaughtException", (error) => {
+  addLog(`Uncaught exception: ${error.stack ?? error.message}`);
+});
+
+process.on("unhandledRejection", (reason) => {
+  addLog(`Unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
 });
 
 function createWindow(): void {
@@ -170,7 +178,13 @@ function broadcastState(): void {
 
 function addLog(line: string): void {
   const stamp = new Date().toLocaleTimeString();
-  logs = [`${stamp} ${line}`, ...logs].slice(0, 60);
+  const entry = `${stamp} ${line}`;
+  logs = [entry, ...logs].slice(0, 100);
+  try {
+    appendFileSync(logPath(), `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
+  } catch {
+    // Logging must never break the tunnel.
+  }
   broadcastState();
 }
 
@@ -276,6 +290,10 @@ function normalizeOptional(value: string | undefined, maxLength: number): string
 
 function configPath(): string {
   return join(app.getPath("userData"), "config.json");
+}
+
+function logPath(): string {
+  return join(app.getPath("userData"), "openrock-client.log");
 }
 
 function applyLoginItemSetting(openAtLogin: boolean): void {

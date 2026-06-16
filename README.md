@@ -182,6 +182,23 @@ In the app, set:
 
 After it connects, use the dashboard's `TCP connection URL` value in Microsoft Remote Desktop.
 
+## Troubleshooting logs
+
+Server logs:
+
+```bash
+ssh -i /path/to/hermes-agent-server.pem ec2-user@44.193.192.39 \
+  "sudo journalctl -u openrock-server --since '30 minutes ago' --no-pager -o short-iso"
+```
+
+Windows desktop client logs:
+
+```text
+%APPDATA%\OpenRock Client\openrock-client.log
+```
+
+The server logs each tunnel connect/disconnect, stream open/close/error, byte counts in both directions, and heartbeat timeouts.
+
 ## Important limitations
 
 - This is a basic TCP tunnel, not a full ngrok replacement.

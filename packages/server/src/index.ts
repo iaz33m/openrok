@@ -35,6 +35,8 @@ type PublicConnection = {
   openedAt: number;
   remoteAddress?: string;
   remotePort?: number;
+  bytesFromClient: number;
+  bytesFromTarget: number;
 };
 
 type Tunnel = {
@@ -57,6 +59,8 @@ type Tunnel = {
 const tunnels = new Map<string, Tunnel>();
 const tunnelsByAgent = new Map<string, Tunnel>();
 const allocatedPorts = new Set<number>();
+const HEARTBEAT_INTERVAL_MS = 25_000;
+const HEARTBEAT_TIMEOUT_MS = 75_000;
 
 const app = express();
 app.use(cors());
@@ -153,6 +157,10 @@ wss.on("connection", (ws) => {
   let tunnel: Tunnel | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
 
+  ws.on("pong", () => {
+    if (tunnel) tunnel.lastSeenAt = Date.now();
+  });
+
   ws.once("message", async (raw) => {
     const hello = parseMessage(raw);
     if (!hello || hello.type !== "agent:hello") {
@@ -187,12 +195,28 @@ wss.on("connection", (ws) => {
 
     heartbeat = setInterval(() => {
       if (!tunnel || ws.readyState !== ws.OPEN) return;
-      send(ws, { type: "ping", ts: Date.now() });
-    }, 25_000);
+      const staleForMs = Date.now() - tunnel.lastSeenAt;
+      if (staleForMs > HEARTBEAT_TIMEOUT_MS) {
+        console.warn(`Tunnel ${tunnel.id} heartbeat timed out after ${staleForMs}ms; terminating agent websocket`);
+        ws.terminate();
+        return;
+      }
+      try {
+        ws.ping();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`Tunnel ${tunnel.id} heartbeat ping failed: ${message}`);
+        ws.terminate();
+      }
+    }, HEARTBEAT_INTERVAL_MS);
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
     if (heartbeat) clearInterval(heartbeat);
+    if (tunnel) {
+      const reasonText = reason.toString("utf8") || "no reason";
+      console.info(`Tunnel ${tunnel.id} websocket closed code=${code} reason="${reasonText}"`);
+    }
     if (tunnel) closeTunnel(tunnel, "Agent disconnected");
   });
 
@@ -266,15 +290,23 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
     return;
   }
 
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 30_000);
+
   const streamId = nanoid();
   tunnel.streams.set(streamId, {
     socket,
     openedAt: Date.now(),
     remoteAddress: socket.remoteAddress,
-    remotePort: socket.remotePort
+    remotePort: socket.remotePort,
+    bytesFromClient: 0,
+    bytesFromTarget: 0
   });
   tunnel.stats.totalConnections += 1;
   tunnel.stats.activeConnections += 1;
+  console.info(
+    `Tunnel ${tunnel.id} stream ${streamId} opened from ${socket.remoteAddress ?? "unknown"}:${socket.remotePort ?? 0}`
+  );
 
   const openMessage: OpenStream = {
     type: "stream:open",
@@ -285,6 +317,8 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
   send(tunnel.ws, openMessage);
 
   socket.on("data", (chunk) => {
+    const stream = tunnel.streams.get(streamId);
+    if (stream) stream.bytesFromClient += chunk.length;
     tunnel.stats.bytesFromClient += chunk.length;
     const dataMessage: StreamData = {
       type: "stream:data",
@@ -294,14 +328,23 @@ function handlePublicConnection(tunnel: Tunnel, socket: net.Socket): void {
     send(tunnel.ws, dataMessage);
   });
 
-  socket.on("close", () => {
-    removePublicStream(tunnel, streamId);
-    send(tunnel.ws, { type: "stream:close", streamId, reason: "Client closed" });
+  socket.on("close", (hadError) => {
+    const stream = removePublicStream(tunnel, streamId);
+    if (!stream) return;
+    console.info(
+      `Tunnel ${tunnel.id} stream ${streamId} public socket closed hadError=${hadError} ` +
+        `bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}`
+    );
+    send(tunnel.ws, { type: "stream:close", streamId, reason: hadError ? "Client socket error" : "Client closed" });
   });
 
   socket.on("error", (error) => {
-    removePublicStream(tunnel, streamId);
-    send(tunnel.ws, { type: "stream:error", streamId, message: error.message });
+    const stream = tunnel.streams.get(streamId);
+    console.warn(
+      `Tunnel ${tunnel.id} stream ${streamId} public socket error: ${error.message}` +
+        (stream ? ` bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}` : "")
+    );
+    if (stream) send(tunnel.ws, { type: "stream:error", streamId, message: error.message });
   });
 }
 
@@ -311,23 +354,30 @@ function handleAgentMessage(tunnel: Tunnel, message: TunnelMessage): void {
       const stream = tunnel.streams.get(message.streamId);
       if (!stream || stream.socket.destroyed) return;
       const data = decodeData(message.data);
+      stream.bytesFromTarget += data.length;
       tunnel.stats.bytesFromTarget += data.length;
       stream.socket.write(data);
       return;
     }
     case "stream:close": {
-      const stream = tunnel.streams.get(message.streamId);
+      const stream = removePublicStream(tunnel, message.streamId);
       if (stream) {
+        console.info(
+          `Tunnel ${tunnel.id} stream ${message.streamId} closed by agent reason="${message.reason ?? "none"}" ` +
+            `bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}`
+        );
         stream.socket.end();
-        removePublicStream(tunnel, message.streamId);
       }
       return;
     }
     case "stream:error": {
-      const stream = tunnel.streams.get(message.streamId);
+      const stream = removePublicStream(tunnel, message.streamId);
       if (stream) {
+        console.warn(
+          `Tunnel ${tunnel.id} stream ${message.streamId} errored by agent: ${message.message} ` +
+            `bytesFromClient=${stream.bytesFromClient} bytesFromTarget=${stream.bytesFromTarget}`
+        );
         stream.socket.destroy(new Error(message.message));
-        removePublicStream(tunnel, message.streamId);
       }
       return;
     }
@@ -358,9 +408,12 @@ function closeTunnel(tunnel: Tunnel, reason: string): void {
   console.info(`Tunnel ${tunnel.id} offline: ${reason}`);
 }
 
-function removePublicStream(tunnel: Tunnel, streamId: string): void {
-  if (!tunnel.streams.delete(streamId)) return;
+function removePublicStream(tunnel: Tunnel, streamId: string): PublicConnection | undefined {
+  const stream = tunnel.streams.get(streamId);
+  if (!stream) return undefined;
+  tunnel.streams.delete(streamId);
   tunnel.stats.activeConnections = Math.max(0, tunnel.stats.activeConnections - 1);
+  return stream;
 }
 
 function allocatePort(desired?: number): number {
@@ -432,7 +485,9 @@ function serializeTunnel(tunnel: Tunnel) {
       streamId,
       remoteAddress: stream.remoteAddress,
       remotePort: stream.remotePort,
-      openedAt: new Date(stream.openedAt).toISOString()
+      openedAt: new Date(stream.openedAt).toISOString(),
+      bytesFromClient: stream.bytesFromClient,
+      bytesFromTarget: stream.bytesFromTarget
     }))
   };
 }
