@@ -157,10 +157,6 @@ wss.on("connection", (ws) => {
   let tunnel: Tunnel | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
 
-  ws.on("pong", () => {
-    if (tunnel) tunnel.lastSeenAt = Date.now();
-  });
-
   ws.once("message", async (raw) => {
     const hello = parseMessage(raw);
     if (!hello || hello.type !== "agent:hello") {
@@ -201,13 +197,7 @@ wss.on("connection", (ws) => {
         ws.terminate();
         return;
       }
-      try {
-        ws.ping();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`Tunnel ${tunnel.id} heartbeat ping failed: ${message}`);
-        ws.terminate();
-      }
+      send(ws, { type: "ping", ts: Date.now() });
     }, HEARTBEAT_INTERVAL_MS);
   });
 
