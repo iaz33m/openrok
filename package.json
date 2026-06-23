@@ -16,6 +16,7 @@
     "package:desktop": "npm run package -w @openrock/desktop-client",
     "smoke": "node tests/smoke-tcp-tunnel.mjs",
     "smoke:recovery": "node tests/recovery-smoke.mjs",
+    "smoke:reconnect": "node tests/reconnect-port-race.mjs",
     "smoke:live": "node tests/live-server-smoke.mjs"
   },
   "workspaces": [

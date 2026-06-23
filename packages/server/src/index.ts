@@ -64,6 +64,10 @@ type Tunnel = {
 const tunnels = new Map<string, Tunnel>();
 const tunnelsByAgent = new Map<string, Tunnel>();
 const allocatedPorts = new Set<number>();
+const closingTunnels = new Map<string, Promise<void>>();
+const closingAgents = new Map<string, Promise<void>>();
+const closingPorts = new Map<number, Promise<void>>();
+const closedTunnelRefs = new WeakSet<Tunnel>();
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const HEARTBEAT_TIMEOUT_MS = 10 * 60_000;
 const HEARTBEAT_WARNING_INTERVAL_MS = 60_000;
@@ -119,8 +123,14 @@ app.post("/api/tunnels/:id/disconnect", authenticateAdmin, (req, res) => {
     res.status(404).json({ error: "Tunnel not found" });
     return;
   }
-  closeTunnel(tunnel, "Disconnected by admin");
-  res.json({ ok: true });
+  closeTunnel(tunnel, "Disconnected by admin")
+    .then(() => {
+      res.json({ ok: true });
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : "Failed to disconnect tunnel";
+      res.status(500).json({ error: message });
+    });
 });
 
 const defaultStaticDir = join(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
@@ -227,7 +237,7 @@ wss.on("connection", (ws) => {
       const reasonText = reason.toString("utf8") || "no reason";
       console.info(`Tunnel ${tunnel.id} websocket closed code=${code} reason="${reasonText}"`);
     }
-    if (tunnel) closeTunnel(tunnel, "Agent disconnected");
+    if (tunnel) void closeTunnel(tunnel, "Agent disconnected");
   });
 
   ws.on("error", (error) => {
@@ -254,7 +264,13 @@ async function registerTunnel(ws: WebSocket, hello: AgentHello): Promise<Tunnel>
 
   const existing = tunnelsByAgent.get(hello.agentId);
   if (existing) {
-    closeTunnel(existing, "Agent reconnected");
+    await closeTunnel(existing, "Agent reconnected");
+  } else {
+    await closingAgents.get(hello.agentId);
+  }
+
+  if (hello.desiredPublicPort !== undefined) {
+    await closingPorts.get(hello.desiredPublicPort);
   }
 
   const publicPort = allocatePort(hello.desiredPublicPort);
@@ -286,7 +302,7 @@ async function registerTunnel(ws: WebSocket, hello: AgentHello): Promise<Tunnel>
   publicServer.on("connection", (socket) => handlePublicConnection(tunnel, socket));
   publicServer.on("error", (error) => {
     console.warn(`Public listener error for tunnel ${tunnel.id}: ${error.message}`);
-    closeTunnel(tunnel, "Public listener failed");
+    void closeTunnel(tunnel, "Public listener failed");
   });
 
   await listen(publicServer, publicPort, config.tcpBindHost);
@@ -438,21 +454,69 @@ function handleAgentStreamData(tunnel: Tunnel, streamId: string, data: Buffer): 
   }
 }
 
-function closeTunnel(tunnel: Tunnel, reason: string): void {
-  if (!tunnels.has(tunnel.id)) return;
-  tunnels.delete(tunnel.id);
-  tunnelsByAgent.delete(tunnel.agentId);
-  allocatedPorts.delete(tunnel.publicPort);
+function closeTunnel(tunnel: Tunnel, reason: string): Promise<void> {
+  const existingClose = closingTunnels.get(tunnel.id);
+  if (existingClose) return existingClose;
+  if (closedTunnelRefs.has(tunnel)) return Promise.resolve();
+  closedTunnelRefs.add(tunnel);
+
+  let closePromise!: Promise<void>;
+  closePromise = closeTunnelOnce(tunnel, reason).finally(() => {
+    if (closingTunnels.get(tunnel.id) === closePromise) closingTunnels.delete(tunnel.id);
+    if (closingAgents.get(tunnel.agentId) === closePromise) closingAgents.delete(tunnel.agentId);
+    if (closingPorts.get(tunnel.publicPort) === closePromise) closingPorts.delete(tunnel.publicPort);
+  });
+  closingTunnels.set(tunnel.id, closePromise);
+  closingAgents.set(tunnel.agentId, closePromise);
+  closingPorts.set(tunnel.publicPort, closePromise);
+  return closePromise;
+}
+
+async function closeTunnelOnce(tunnel: Tunnel, reason: string): Promise<void> {
+  if (tunnels.get(tunnel.id) === tunnel) {
+    tunnels.delete(tunnel.id);
+  }
+  if (tunnelsByAgent.get(tunnel.agentId) === tunnel) {
+    tunnelsByAgent.delete(tunnel.agentId);
+  }
 
   for (const stream of tunnel.streams.values()) {
     stream.socket.destroy();
   }
   tunnel.streams.clear();
-  tunnel.publicServer.close();
+
   if (tunnel.ws.readyState === tunnel.ws.OPEN || tunnel.ws.readyState === tunnel.ws.CONNECTING) {
     tunnel.ws.close(1000, reason);
   }
+
+  await closeServer(tunnel.publicServer);
+  allocatedPorts.delete(tunnel.publicPort);
   console.info(`Tunnel ${tunnel.id} offline: ${reason}`);
+}
+
+function closeServer(server: net.Server): Promise<void> {
+  return new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+
+    try {
+      server.close((error) => {
+        if (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "ERR_SERVER_NOT_RUNNING") {
+            console.warn(`Public listener close error: ${error.message}`);
+          }
+        }
+        resolve();
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Public listener close threw: ${message}`);
+      resolve();
+    }
+  });
 }
 
 function removePublicStream(tunnel: Tunnel, streamId: string): PublicConnection | undefined {
